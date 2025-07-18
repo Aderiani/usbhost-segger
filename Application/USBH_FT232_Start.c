@@ -113,29 +113,56 @@ static struct {
 
 /*********************************************************************
 *
-*       _GetInterfaceNumber
+*       Static data for FT4232H port tracking
+*
+**********************************************************************
+*/
+static struct {
+  U8  DeviceCount;
+  U8  PortCIndex;
+  U16 VendorId;
+  U16 ProductId;
+} _FT4232H_Info = {0, 0xFF, 0, 0};
+
+/*********************************************************************
+*
+*       _IdentifyFT4232H_Port
 *
 *  Function description
-*    Gets the interface number for the device
-*    For FT4232H: Interface 0=A, 1=B, 2=C, 3=D
+*    For FT4232H devices, determines which port based on enumeration order
+*    FT4232H always enumerates in order: A, B, C, D
 */
-static int _GetInterfaceNumber(U8 DevIndex) {
-  USBH_FT232_HANDLE hDevice;
-  USBH_INTERFACE_HANDLE hInterface;
-  USBH_INTERFACE_INFO InterfaceInfo;
-  int InterfaceNum = -1;
+static DEVICE_TYPE _IdentifyFT4232H_Port(U8 DevIndex, USBH_FT232_DEVICE_INFO* pInfo) {
+  static U8 LastDevIndex = 0xFF;
+  static U8 PortCounter = 0;
   
-  hDevice = USBH_FT232_Open(DevIndex);
-  if (hDevice != USBH_FT232_INVALID_HANDLE) {
-    hInterface = USBH_FT232_GetInterfaceHandle(hDevice);
-    if (hInterface != 0) {
-      USBH_GetInterfaceInfo(hInterface, &InterfaceInfo);
-      InterfaceNum = InterfaceInfo.InterfaceIndex;
-    }
-    USBH_FT232_Close(hDevice);
+  //
+  // If this is a new FT4232H device (different from last), reset counter
+  //
+  if (DevIndex != (LastDevIndex + 1)) {
+    PortCounter = 0;
   }
   
-  return InterfaceNum;
+  LastDevIndex = DevIndex;
+  
+  //
+  // FT4232H enumerates 4 consecutive devices
+  //
+  DEVICE_TYPE Type = DEVICE_TYPE_FT4232H_PORT_A + PortCounter;
+  
+  //
+  // Track Port C index
+  //
+  if (PortCounter == 2) {  // Port C is the 3rd port (index 2)
+    _FT4232H_Info.PortCIndex = DevIndex;
+  }
+  
+  PortCounter++;
+  if (PortCounter >= 4) {
+    PortCounter = 0;
+  }
+  
+  return Type;
 }
 
 /*********************************************************************
@@ -146,26 +173,16 @@ static int _GetInterfaceNumber(U8 DevIndex) {
 *    Identifies the device type and port
 */
 static DEVICE_TYPE _IdentifyDevice(USBH_FT232_DEVICE_INFO* pInfo, U8 DevIndex) {
-  int InterfaceNum;
+  static U16 LastUnknownPID = 0;
+  static U8 UnknownPIDCount = 0;
   
   //
   // Check Product ID
   //
   switch (pInfo->ProductId) {
-    case 0x6011:  // FT4232H
-      InterfaceNum = _GetInterfaceNumber(DevIndex);
-      USBH_Logf_Application("FT4232H detected, Interface %d (Port %c)", 
-                            InterfaceNum, 'A' + InterfaceNum);
-      
-      switch (InterfaceNum) {
-        case 0: return DEVICE_TYPE_FT4232H_PORT_A;
-        case 1: return DEVICE_TYPE_FT4232H_PORT_B;
-        case 2: return DEVICE_TYPE_FT4232H_PORT_C;
-        case 3: return DEVICE_TYPE_FT4232H_PORT_D;
-        default:
-          USBH_Logf_Application("Unknown FT4232H interface: %d", InterfaceNum);
-          return DEVICE_TYPE_UNKNOWN;
-      }
+    case 0x6011:  // FT4232H standard PID
+    case 0x6043:  // FT4232H variant (custom PID)
+      return _IdentifyFT4232H_Port(DevIndex, pInfo);
     
     case 0x6001:  // FT232R/FT232B
     case 0x6010:  // FT2232H/FT2232D
@@ -173,6 +190,26 @@ static DEVICE_TYPE _IdentifyDevice(USBH_FT232_DEVICE_INFO* pInfo, U8 DevIndex) {
       return DEVICE_TYPE_FT232;
     
     default:
+      //
+      // Unknown PID - might be a custom FT4232H
+      // If we see 4 consecutive devices with the same unknown PID,
+      // assume it's an FT4232H
+      //
+      if (pInfo->ProductId == LastUnknownPID || LastUnknownPID == 0) {
+        LastUnknownPID = pInfo->ProductId;
+        UnknownPIDCount++;
+        
+        if (UnknownPIDCount <= 4) {
+          USBH_Logf_Application("Unknown FTDI PID 0x%04X - device %d of possible FT4232H", 
+                                pInfo->ProductId, UnknownPIDCount);
+          return _IdentifyFT4232H_Port(DevIndex, pInfo);
+        }
+      } else {
+        // Different PID, reset counter
+        LastUnknownPID = pInfo->ProductId;
+        UnknownPIDCount = 1;
+      }
+      
       USBH_Logf_Application("Unknown FTDI device: PID=0x%04X", pInfo->ProductId);
       return DEVICE_TYPE_FT232;  // Assume single port
   }
@@ -409,9 +446,10 @@ static void _cbOnAddRemoveDevice(void * pContext, U8 DevIndex, USBH_DEVICE_EVENT
         }
       } else if (DeviceType >= DEVICE_TYPE_FT4232H_PORT_A && DeviceType <= DEVICE_TYPE_FT4232H_PORT_D) {
         //
-        // Other FT4232H ports - ignore
+        // Other FT4232H ports - log which port
         //
-        USBH_Logf_Application("Ignoring FT4232H Port %c", 'A' + (DeviceType - DEVICE_TYPE_FT4232H_PORT_A));
+        char PortChar = 'A' + (DeviceType - DEVICE_TYPE_FT4232H_PORT_A);
+        USBH_Logf_Application("FT4232H Port %c detected, ignoring (only using Port C)", PortChar);
       }
     }
     break;
